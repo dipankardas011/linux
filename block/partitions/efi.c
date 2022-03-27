@@ -8,8 +8,6 @@
  * efi.[ch] by Matt Domsch <Matt_Domsch@dell.com>
  *   Copyright 2000,2001,2002,2004 Dell Inc.
  *
- * TODO:
- *
  * Changelog:
  * Mon August 5th, 2013 Davidlohr Bueso <davidlohr@hp.com>
  * - detect hybrid MBRs, tighter pMBR checking & cleanups.
