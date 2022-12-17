@@ -36,7 +36,7 @@
 
 #define IBMVSCSIS_VERSION	"v0.2"
 
-#define	INITIAL_SRP_LIMIT	800
+#define	INITIAL_SRP_LIMIT	1024
 #define	DEFAULT_MAX_SECTORS	256
 #define MAX_TXU			1024 * 1024
 
@@ -444,7 +444,7 @@ static void ibmvscsis_disconnect(struct work_struct *work)
 		break;
 
 	/*
-	 * Can transition from this state to to unconfiguring
+	 * Can transition from this state to unconfiguring
 	 * or err disconnect.
 	 */
 	case ERR_DISCONNECT_RECONNECT:

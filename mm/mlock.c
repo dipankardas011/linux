@@ -28,7 +28,14 @@
 
 #include "internal.h"
 
-static DEFINE_PER_CPU(struct pagevec, mlock_pvec);
+struct mlock_pvec {
+	local_lock_t lock;
+	struct pagevec vec;
+};
+
+static DEFINE_PER_CPU(struct mlock_pvec, mlock_pvec) = {
+	.lock = INIT_LOCAL_LOCK(lock),
+};
 
 bool can_do_mlock(void)
 {
@@ -203,18 +210,30 @@ static void mlock_pagevec(struct pagevec *pvec)
 	pagevec_reinit(pvec);
 }
 
-void mlock_page_drain(int cpu)
+void mlock_page_drain_local(void)
 {
 	struct pagevec *pvec;
 
-	pvec = &per_cpu(mlock_pvec, cpu);
+	local_lock(&mlock_pvec.lock);
+	pvec = this_cpu_ptr(&mlock_pvec.vec);
+	if (pagevec_count(pvec))
+		mlock_pagevec(pvec);
+	local_unlock(&mlock_pvec.lock);
+}
+
+void mlock_page_drain_remote(int cpu)
+{
+	struct pagevec *pvec;
+
+	WARN_ON_ONCE(cpu_online(cpu));
+	pvec = &per_cpu(mlock_pvec.vec, cpu);
 	if (pagevec_count(pvec))
 		mlock_pagevec(pvec);
 }
 
 bool need_mlock_page_drain(int cpu)
 {
-	return pagevec_count(&per_cpu(mlock_pvec, cpu));
+	return pagevec_count(&per_cpu(mlock_pvec.vec, cpu));
 }
 
 /**
@@ -223,7 +242,10 @@ bool need_mlock_page_drain(int cpu)
  */
 void mlock_folio(struct folio *folio)
 {
-	struct pagevec *pvec = &get_cpu_var(mlock_pvec);
+	struct pagevec *pvec;
+
+	local_lock(&mlock_pvec.lock);
+	pvec = this_cpu_ptr(&mlock_pvec.vec);
 
 	if (!folio_test_set_mlocked(folio)) {
 		int nr_pages = folio_nr_pages(folio);
@@ -236,7 +258,7 @@ void mlock_folio(struct folio *folio)
 	if (!pagevec_add(pvec, mlock_lru(&folio->page)) ||
 	    folio_test_large(folio) || lru_cache_disabled())
 		mlock_pagevec(pvec);
-	put_cpu_var(mlock_pvec);
+	local_unlock(&mlock_pvec.lock);
 }
 
 /**
@@ -245,9 +267,11 @@ void mlock_folio(struct folio *folio)
  */
 void mlock_new_page(struct page *page)
 {
-	struct pagevec *pvec = &get_cpu_var(mlock_pvec);
+	struct pagevec *pvec;
 	int nr_pages = thp_nr_pages(page);
 
+	local_lock(&mlock_pvec.lock);
+	pvec = this_cpu_ptr(&mlock_pvec.vec);
 	SetPageMlocked(page);
 	mod_zone_page_state(page_zone(page), NR_MLOCK, nr_pages);
 	__count_vm_events(UNEVICTABLE_PGMLOCKED, nr_pages);
@@ -256,7 +280,7 @@ void mlock_new_page(struct page *page)
 	if (!pagevec_add(pvec, mlock_new(page)) ||
 	    PageHead(page) || lru_cache_disabled())
 		mlock_pagevec(pvec);
-	put_cpu_var(mlock_pvec);
+	local_unlock(&mlock_pvec.lock);
 }
 
 /**
@@ -265,8 +289,10 @@ void mlock_new_page(struct page *page)
  */
 void munlock_page(struct page *page)
 {
-	struct pagevec *pvec = &get_cpu_var(mlock_pvec);
+	struct pagevec *pvec;
 
+	local_lock(&mlock_pvec.lock);
+	pvec = this_cpu_ptr(&mlock_pvec.vec);
 	/*
 	 * TestClearPageMlocked(page) must be left to __munlock_page(),
 	 * which will check whether the page is multiply mlocked.
@@ -276,7 +302,7 @@ void munlock_page(struct page *page)
 	if (!pagevec_add(pvec, page) ||
 	    PageHead(page) || lru_cache_disabled())
 		mlock_pagevec(pvec);
-	put_cpu_var(mlock_pvec);
+	local_unlock(&mlock_pvec.lock);
 }
 
 static int mlock_pte_range(pmd_t *pmd, unsigned long addr,
@@ -307,7 +333,7 @@ static int mlock_pte_range(pmd_t *pmd, unsigned long addr,
 		if (!pte_present(*pte))
 			continue;
 		page = vm_normal_page(vma, addr, *pte);
-		if (!page)
+		if (!page || is_zone_device_page(page))
 			continue;
 		if (PageTransCompound(page))
 			continue;
@@ -445,6 +471,7 @@ static int apply_vma_lock_flags(unsigned long start, size_t len,
 	unsigned long nstart, end, tmp;
 	struct vm_area_struct *vma, *prev;
 	int error;
+	MA_STATE(mas, &current->mm->mm_mt, start, start);
 
 	VM_BUG_ON(offset_in_page(start));
 	VM_BUG_ON(len != PAGE_ALIGN(len));
@@ -453,13 +480,14 @@ static int apply_vma_lock_flags(unsigned long start, size_t len,
 		return -EINVAL;
 	if (end == start)
 		return 0;
-	vma = find_vma(current->mm, start);
-	if (!vma || vma->vm_start > start)
+	vma = mas_walk(&mas);
+	if (!vma)
 		return -ENOMEM;
 
-	prev = vma->vm_prev;
 	if (start > vma->vm_start)
 		prev = vma;
+	else
+		prev = mas_prev(&mas, 0);
 
 	for (nstart = start ; ; ) {
 		vm_flags_t newflags = vma->vm_flags & VM_LOCKED_CLEAR_MASK;
@@ -479,7 +507,7 @@ static int apply_vma_lock_flags(unsigned long start, size_t len,
 		if (nstart >= end)
 			break;
 
-		vma = prev->vm_next;
+		vma = find_vma(prev->vm_mm, prev->vm_end);
 		if (!vma || vma->vm_start != nstart) {
 			error = -ENOMEM;
 			break;
@@ -500,24 +528,21 @@ static unsigned long count_mm_mlocked_page_nr(struct mm_struct *mm,
 {
 	struct vm_area_struct *vma;
 	unsigned long count = 0;
+	unsigned long end;
+	VMA_ITERATOR(vmi, mm, start);
 
-	if (mm == NULL)
-		mm = current->mm;
+	/* Don't overflow past ULONG_MAX */
+	if (unlikely(ULONG_MAX - len < start))
+		end = ULONG_MAX;
+	else
+		end = start + len;
 
-	vma = find_vma(mm, start);
-	if (vma == NULL)
-		return 0;
-
-	for (; vma ; vma = vma->vm_next) {
-		if (start >= vma->vm_end)
-			continue;
-		if (start + len <=  vma->vm_start)
-			break;
+	for_each_vma_range(vmi, vma, end) {
 		if (vma->vm_flags & VM_LOCKED) {
 			if (start > vma->vm_start)
 				count -= (start - vma->vm_start);
-			if (start + len < vma->vm_end) {
-				count += start + len - vma->vm_start;
+			if (end < vma->vm_end) {
+				count += end - vma->vm_start;
 				break;
 			}
 			count += vma->vm_end - vma->vm_start;
@@ -633,6 +658,7 @@ SYSCALL_DEFINE2(munlock, unsigned long, start, size_t, len)
  */
 static int apply_mlockall_flags(int flags)
 {
+	MA_STATE(mas, &current->mm->mm_mt, 0, 0);
 	struct vm_area_struct *vma, *prev = NULL;
 	vm_flags_t to_add = 0;
 
@@ -653,7 +679,7 @@ static int apply_mlockall_flags(int flags)
 			to_add |= VM_LOCKONFAULT;
 	}
 
-	for (vma = current->mm->mmap; vma ; vma = prev->vm_next) {
+	mas_for_each(&mas, vma, ULONG_MAX) {
 		vm_flags_t newflags;
 
 		newflags = vma->vm_flags & VM_LOCKED_CLEAR_MASK;
@@ -661,6 +687,7 @@ static int apply_mlockall_flags(int flags)
 
 		/* Ignore errors */
 		mlock_fixup(vma, &prev, vma->vm_start, vma->vm_end, newflags);
+		mas_pause(&mas);
 		cond_resched();
 	}
 out:
@@ -721,13 +748,12 @@ int user_shm_lock(size_t size, struct ucounts *ucounts)
 
 	locked = (size + PAGE_SIZE - 1) >> PAGE_SHIFT;
 	lock_limit = rlimit(RLIMIT_MEMLOCK);
-	if (lock_limit == RLIM_INFINITY)
-		allowed = 1;
-	lock_limit >>= PAGE_SHIFT;
+	if (lock_limit != RLIM_INFINITY)
+		lock_limit >>= PAGE_SHIFT;
 	spin_lock(&shmlock_user_lock);
 	memlock = inc_rlimit_ucounts(ucounts, UCOUNT_RLIMIT_MEMLOCK, locked);
 
-	if (!allowed && (memlock == LONG_MAX || memlock > lock_limit) && !capable(CAP_IPC_LOCK)) {
+	if ((memlock == LONG_MAX || memlock > lock_limit) && !capable(CAP_IPC_LOCK)) {
 		dec_rlimit_ucounts(ucounts, UCOUNT_RLIMIT_MEMLOCK, locked);
 		goto out;
 	}

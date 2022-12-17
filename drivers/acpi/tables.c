@@ -151,8 +151,8 @@ void acpi_table_print_madt_entry(struct acpi_subtable_header *header)
 		{
 			struct acpi_madt_local_apic_override *p =
 			    (struct acpi_madt_local_apic_override *)header;
-			pr_info("LAPIC_ADDR_OVR (address[%p])\n",
-				(void *)(unsigned long)p->address);
+			pr_info("LAPIC_ADDR_OVR (address[0x%llx])\n",
+				p->address);
 		}
 		break;
 
@@ -207,6 +207,16 @@ void acpi_table_print_madt_entry(struct acpi_subtable_header *header)
 			pr_debug("GIC Distributor (gic_id[0x%04x] address[%llx] gsi_base[%d])\n",
 				 p->gic_id, p->base_address,
 				 p->global_irq_base);
+		}
+		break;
+
+	case ACPI_MADT_TYPE_CORE_PIC:
+		{
+			struct acpi_madt_core_pic *p = (struct acpi_madt_core_pic *)header;
+
+			pr_debug("CORE PIC (processor_id[0x%02x] core_id[0x%02x] %s)\n",
+				 p->processor_id, p->core_id,
+				 (p->flags & ACPI_MADT_ENABLED) ? "enabled" : "disabled");
 		}
 		break;
 
@@ -838,12 +848,11 @@ acpi_status acpi_os_table_override(struct acpi_table_header *existing_table,
 /*
  * acpi_locate_initial_tables()
  *
- * find RSDP, find and checksum SDT/XSDT.
- * checksum all tables, print SDT/XSDT
+ * Get the RSDP, then find and checksum all the ACPI tables.
  *
- * result: sdt_entry[] is initialized
+ * result: initial_tables[] is initialized, and points to
+ * a list of ACPI tables.
  */
-
 int __init acpi_locate_initial_tables(void)
 {
 	acpi_status status;

@@ -159,13 +159,13 @@ static void vrf_get_stats64(struct net_device *dev,
 
 		dstats = per_cpu_ptr(dev->dstats, i);
 		do {
-			start = u64_stats_fetch_begin_irq(&dstats->syncp);
+			start = u64_stats_fetch_begin(&dstats->syncp);
 			tbytes = dstats->tx_bytes;
 			tpkts = dstats->tx_pkts;
 			tdrops = dstats->tx_drps;
 			rbytes = dstats->rx_bytes;
 			rpkts = dstats->rx_pkts;
-		} while (u64_stats_fetch_retry_irq(&dstats->syncp, start));
+		} while (u64_stats_fetch_retry(&dstats->syncp, start));
 		stats->tx_bytes += tbytes;
 		stats->tx_packets += tpkts;
 		stats->tx_dropped += tdrops;
@@ -814,8 +814,8 @@ static void vrf_rt6_release(struct net_device *dev, struct net_vrf *vrf)
 	 */
 	if (rt6) {
 		dst = &rt6->dst;
-		dev_replace_track(dst->dev, net->loopback_dev,
-				  &dst->dev_tracker, GFP_KERNEL);
+		netdev_ref_replace(dst->dev, net->loopback_dev,
+				   &dst->dev_tracker, GFP_KERNEL);
 		dst->dev = net->loopback_dev;
 		dst_release(dst);
 	}
@@ -1061,8 +1061,8 @@ static void vrf_rtable_release(struct net_device *dev, struct net_vrf *vrf)
 	 */
 	if (rth) {
 		dst = &rth->dst;
-		dev_replace_track(dst->dev, net->loopback_dev,
-				  &dst->dev_tracker, GFP_KERNEL);
+		netdev_ref_replace(dst->dev, net->loopback_dev,
+				   &dst->dev_tracker, GFP_KERNEL);
 		dst->dev = net->loopback_dev;
 		dst_release(dst);
 	}
@@ -1077,7 +1077,7 @@ static int vrf_rtable_create(struct net_device *dev)
 		return -ENOMEM;
 
 	/* create a dst for routing packets out through a VRF device */
-	rth = rt_dst_alloc(dev, 0, RTN_UNICAST, 1, 1);
+	rth = rt_dst_alloc(dev, 0, RTN_UNICAST, 1);
 	if (!rth)
 		return -ENOMEM;
 
@@ -1265,6 +1265,7 @@ static int vrf_prepare_mac_header(struct sk_buff *skb,
 	eth = (struct ethhdr *)skb->data;
 
 	skb_reset_mac_header(skb);
+	skb_reset_mac_len(skb);
 
 	/* we set the ethernet destination and the source addresses to the
 	 * address of the VRF device.
@@ -1294,9 +1295,9 @@ static int vrf_prepare_mac_header(struct sk_buff *skb,
  */
 static int vrf_add_mac_header_if_unset(struct sk_buff *skb,
 				       struct net_device *vrf_dev,
-				       u16 proto)
+				       u16 proto, struct net_device *orig_dev)
 {
-	if (skb_mac_header_was_set(skb))
+	if (skb_mac_header_was_set(skb) && dev_has_header(orig_dev))
 		return 0;
 
 	return vrf_prepare_mac_header(skb, vrf_dev, proto);
@@ -1402,6 +1403,8 @@ static struct sk_buff *vrf_ip6_rcv(struct net_device *vrf_dev,
 
 	/* if packet is NDISC then keep the ingress interface */
 	if (!is_ndisc) {
+		struct net_device *orig_dev = skb->dev;
+
 		vrf_rx_stats(vrf_dev, skb->len);
 		skb->dev = vrf_dev;
 		skb->skb_iif = vrf_dev->ifindex;
@@ -1410,7 +1413,8 @@ static struct sk_buff *vrf_ip6_rcv(struct net_device *vrf_dev,
 			int err;
 
 			err = vrf_add_mac_header_if_unset(skb, vrf_dev,
-							  ETH_P_IPV6);
+							  ETH_P_IPV6,
+							  orig_dev);
 			if (likely(!err)) {
 				skb_push(skb, skb->mac_len);
 				dev_queue_xmit_nit(skb, vrf_dev);
@@ -1440,6 +1444,8 @@ static struct sk_buff *vrf_ip6_rcv(struct net_device *vrf_dev,
 static struct sk_buff *vrf_ip_rcv(struct net_device *vrf_dev,
 				  struct sk_buff *skb)
 {
+	struct net_device *orig_dev = skb->dev;
+
 	skb->dev = vrf_dev;
 	skb->skb_iif = vrf_dev->ifindex;
 	IPCB(skb)->flags |= IPSKB_L3SLAVE;
@@ -1460,7 +1466,8 @@ static struct sk_buff *vrf_ip_rcv(struct net_device *vrf_dev,
 	if (!list_empty(&vrf_dev->ptype_all)) {
 		int err;
 
-		err = vrf_add_mac_header_if_unset(skb, vrf_dev, ETH_P_IP);
+		err = vrf_add_mac_header_if_unset(skb, vrf_dev, ETH_P_IP,
+						  orig_dev);
 		if (likely(!err)) {
 			skb_push(skb, skb->mac_len);
 			dev_queue_xmit_nit(skb, vrf_dev);
@@ -1534,8 +1541,8 @@ static const struct l3mdev_ops vrf_l3mdev_ops = {
 static void vrf_get_drvinfo(struct net_device *dev,
 			    struct ethtool_drvinfo *info)
 {
-	strlcpy(info->driver, DRV_NAME, sizeof(info->driver));
-	strlcpy(info->version, DRV_VERSION, sizeof(info->version));
+	strscpy(info->driver, DRV_NAME, sizeof(info->driver));
+	strscpy(info->version, DRV_VERSION, sizeof(info->version));
 }
 
 static const struct ethtool_ops vrf_ethtool_ops = {

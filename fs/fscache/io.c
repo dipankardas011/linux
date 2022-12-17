@@ -235,8 +235,7 @@ static void fscache_wreq_done(void *priv, ssize_t transferred_or_error,
 {
 	struct fscache_write_request *wreq = priv;
 
-	fscache_clear_page_bits(fscache_cres_cookie(&wreq->cache_resources),
-				wreq->mapping, wreq->start, wreq->len,
+	fscache_clear_page_bits(wreq->mapping, wreq->start, wreq->len,
 				wreq->set_bits);
 
 	if (wreq->term_func)
@@ -287,7 +286,7 @@ void __fscache_write_to_cache(struct fscache_cookie *cookie,
 	 * taken into account.
 	 */
 
-	iov_iter_xarray(&iter, WRITE, &mapping->i_pages, start, len);
+	iov_iter_xarray(&iter, ITER_SOURCE, &mapping->i_pages, start, len);
 	fscache_write(cres, start, &iter, fscache_wreq_done, wreq);
 	return;
 
@@ -296,7 +295,7 @@ abandon_end:
 abandon_free:
 	kfree(wreq);
 abandon:
-	fscache_clear_page_bits(cookie, mapping, start, len, cond);
+	fscache_clear_page_bits(mapping, start, len, cond);
 	if (term_func)
 		term_func(term_func_priv, ret, false);
 }

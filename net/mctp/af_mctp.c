@@ -93,13 +93,13 @@ out_release:
 static int mctp_sendmsg(struct socket *sock, struct msghdr *msg, size_t len)
 {
 	DECLARE_SOCKADDR(struct sockaddr_mctp *, addr, msg->msg_name);
-	const int hlen = MCTP_HEADER_MAXLEN + sizeof(struct mctp_hdr);
 	int rc, addrlen = msg->msg_namelen;
 	struct sock *sk = sock->sk;
 	struct mctp_sock *msk = container_of(sk, struct mctp_sock, sk);
 	struct mctp_skb_cb *cb;
 	struct mctp_route *rt;
-	struct sk_buff *skb;
+	struct sk_buff *skb = NULL;
+	int hlen;
 
 	if (addr) {
 		const u8 tagbits = MCTP_TAG_MASK | MCTP_TAG_OWNER |
@@ -129,6 +129,34 @@ static int mctp_sendmsg(struct socket *sock, struct msghdr *msg, size_t len)
 	if (addr->smctp_network == MCTP_NET_ANY)
 		addr->smctp_network = mctp_default_net(sock_net(sk));
 
+	/* direct addressing */
+	if (msk->addr_ext && addrlen >= sizeof(struct sockaddr_mctp_ext)) {
+		DECLARE_SOCKADDR(struct sockaddr_mctp_ext *,
+				 extaddr, msg->msg_name);
+		struct net_device *dev;
+
+		rc = -EINVAL;
+		rcu_read_lock();
+		dev = dev_get_by_index_rcu(sock_net(sk), extaddr->smctp_ifindex);
+		/* check for correct halen */
+		if (dev && extaddr->smctp_halen == dev->addr_len) {
+			hlen = LL_RESERVED_SPACE(dev) + sizeof(struct mctp_hdr);
+			rc = 0;
+		}
+		rcu_read_unlock();
+		if (rc)
+			goto err_free;
+		rt = NULL;
+	} else {
+		rt = mctp_route_lookup(sock_net(sk), addr->smctp_network,
+				       addr->smctp_addr.s_addr);
+		if (!rt) {
+			rc = -EHOSTUNREACH;
+			goto err_free;
+		}
+		hlen = LL_RESERVED_SPACE(rt->dev->dev) + sizeof(struct mctp_hdr);
+	}
+
 	skb = sock_alloc_send_skb(sk, hlen + 1 + len,
 				  msg->msg_flags & MSG_DONTWAIT, &rc);
 	if (!skb)
@@ -147,8 +175,8 @@ static int mctp_sendmsg(struct socket *sock, struct msghdr *msg, size_t len)
 	cb = __mctp_cb(skb);
 	cb->net = addr->smctp_network;
 
-	/* direct addressing */
-	if (msk->addr_ext && addrlen >= sizeof(struct sockaddr_mctp_ext)) {
+	if (!rt) {
+		/* fill extended address in cb */
 		DECLARE_SOCKADDR(struct sockaddr_mctp_ext *,
 				 extaddr, msg->msg_name);
 
@@ -159,17 +187,9 @@ static int mctp_sendmsg(struct socket *sock, struct msghdr *msg, size_t len)
 		}
 
 		cb->ifindex = extaddr->smctp_ifindex;
+		/* smctp_halen is checked above */
 		cb->halen = extaddr->smctp_halen;
 		memcpy(cb->haddr, extaddr->smctp_haddr, cb->halen);
-
-		rt = NULL;
-	} else {
-		rt = mctp_route_lookup(sock_net(sk), addr->smctp_network,
-				       addr->smctp_addr.s_addr);
-		if (!rt) {
-			rc = -EHOSTUNREACH;
-			goto err_free;
-		}
 	}
 
 	rc = mctp_local_output(sk, rt, skb, addr->smctp_addr.s_addr,
@@ -196,7 +216,7 @@ static int mctp_recvmsg(struct socket *sock, struct msghdr *msg, size_t len,
 	if (flags & ~(MSG_DONTWAIT | MSG_TRUNC | MSG_PEEK))
 		return -EOPNOTSUPP;
 
-	skb = skb_recv_datagram(sk, flags, flags & MSG_DONTWAIT, &rc);
+	skb = skb_recv_datagram(sk, flags, &rc);
 	if (!skb)
 		return rc;
 
@@ -218,7 +238,7 @@ static int mctp_recvmsg(struct socket *sock, struct msghdr *msg, size_t len,
 	if (rc < 0)
 		goto out_free;
 
-	sock_recv_ts_and_drops(msg, sk, skb);
+	sock_recv_cmsgs(msg, sk, skb);
 
 	if (addr) {
 		struct mctp_skb_cb *cb = mctp_cb(skb);
@@ -275,11 +295,12 @@ __must_hold(&net->mctp.keys_lock)
 	mctp_dev_release_key(key->dev, key);
 	spin_unlock_irqrestore(&key->lock, flags);
 
-	hlist_del(&key->hlist);
-	hlist_del(&key->sklist);
-
-	/* unref for the lists */
-	mctp_key_unref(key);
+	if (!hlist_unhashed(&key->hlist)) {
+		hlist_del_init(&key->hlist);
+		hlist_del_init(&key->sklist);
+		/* unref for the lists */
+		mctp_key_unref(key);
+	}
 
 	kfree_skb(skb);
 }
@@ -353,9 +374,17 @@ static int mctp_ioctl_alloctag(struct mctp_sock *msk, unsigned long arg)
 
 	ctl.tag = tag | MCTP_TAG_OWNER | MCTP_TAG_PREALLOC;
 	if (copy_to_user((void __user *)arg, &ctl, sizeof(ctl))) {
-		spin_lock_irqsave(&key->lock, flags);
-		__mctp_key_remove(key, net, flags, MCTP_TRACE_KEY_DROPPED);
+		unsigned long fl2;
+		/* Unwind our key allocation: the keys list lock needs to be
+		 * taken before the individual key locks, and we need a valid
+		 * flags value (fl2) to pass to __mctp_key_remove, hence the
+		 * second spin_lock_irqsave() rather than a plain spin_lock().
+		 */
+		spin_lock_irqsave(&net->mctp.keys_lock, flags);
+		spin_lock_irqsave(&key->lock, fl2);
+		__mctp_key_remove(key, net, fl2, MCTP_TRACE_KEY_DROPPED);
 		mctp_key_unref(key);
+		spin_unlock_irqrestore(&net->mctp.keys_lock, flags);
 		return -EFAULT;
 	}
 
@@ -636,12 +665,14 @@ static __init int mctp_init(void)
 
 	rc = mctp_neigh_init();
 	if (rc)
-		goto err_unreg_proto;
+		goto err_unreg_routes;
 
 	mctp_device_init();
 
 	return 0;
 
+err_unreg_routes:
+	mctp_routes_exit();
 err_unreg_proto:
 	proto_unregister(&mctp_proto);
 err_unreg_sock:

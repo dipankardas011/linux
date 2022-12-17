@@ -95,6 +95,7 @@ struct cpuinfo_parisc {
 
 extern struct system_cpuinfo_parisc boot_cpu_data;
 DECLARE_PER_CPU(struct cpuinfo_parisc, cpu_data);
+extern int time_keeper_id;		/* CPU used for timekeeping */
 
 #define CPU_HVERSION ((boot_cpu_data.hversion >> 4) & 0x0FFF)
 
@@ -264,9 +265,6 @@ on downward growing arches, it looks like this:
 } while(0)
 
 struct mm_struct;
-
-/* Free all resources held by a thread. */
-extern void release_thread(struct task_struct *);
 
 extern unsigned long __get_wchan(struct task_struct *p);
 

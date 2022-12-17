@@ -14,7 +14,7 @@
 #include <linux/net.h>
 #include <linux/tracepoint.h>
 
-#include <trace/events/sunrpc_base.h>
+#include <trace/misc/sunrpc.h>
 
 TRACE_DEFINE_ENUM(SOCK_STREAM);
 TRACE_DEFINE_ENUM(SOCK_DGRAM);
@@ -311,7 +311,6 @@ TRACE_EVENT(rpc_request,
 		{ RPC_TASK_MOVEABLE, "MOVEABLE" },			\
 		{ RPC_TASK_NULLCREDS, "NULLCREDS" },			\
 		{ RPC_CALL_MAJORSEEN, "MAJORSEEN" },			\
-		{ RPC_TASK_ROOTCREDS, "ROOTCREDS" },			\
 		{ RPC_TASK_DYNAMIC, "DYNAMIC" },			\
 		{ RPC_TASK_NO_ROUND_ROBIN, "NO_ROUND_ROBIN" },		\
 		{ RPC_TASK_SOFT, "SOFT" },				\
@@ -1005,7 +1004,6 @@ DEFINE_RPC_XPRT_LIFETIME_EVENT(connect);
 DEFINE_RPC_XPRT_LIFETIME_EVENT(disconnect_auto);
 DEFINE_RPC_XPRT_LIFETIME_EVENT(disconnect_done);
 DEFINE_RPC_XPRT_LIFETIME_EVENT(disconnect_force);
-DEFINE_RPC_XPRT_LIFETIME_EVENT(disconnect_cleanup);
 DEFINE_RPC_XPRT_LIFETIME_EVENT(destroy);
 
 DECLARE_EVENT_CLASS(rpc_xprt_event,
@@ -1266,6 +1264,26 @@ TRACE_EVENT(xprt_reserve,
 	TP_printk(SUNRPC_TRACE_TASK_SPECIFIER " xid=0x%08x",
 		__entry->task_id, __entry->client_id, __entry->xid
 	)
+);
+
+TRACE_EVENT(xs_data_ready,
+	TP_PROTO(
+		const struct rpc_xprt *xprt
+	),
+
+	TP_ARGS(xprt),
+
+	TP_STRUCT__entry(
+		__string(addr, xprt->address_strings[RPC_DISPLAY_ADDR])
+		__string(port, xprt->address_strings[RPC_DISPLAY_PORT])
+	),
+
+	TP_fast_assign(
+		__assign_str(addr, xprt->address_strings[RPC_DISPLAY_ADDR]);
+		__assign_str(port, xprt->address_strings[RPC_DISPLAY_PORT]);
+	),
+
+	TP_printk("peer=[%s]:%s", __get_str(addr), __get_str(port))
 );
 
 TRACE_EVENT(xs_stream_read_data,
@@ -1648,10 +1666,12 @@ TRACE_DEFINE_ENUM(SVC_COMPLETE);
 #define SVC_RQST_ENDPOINT_VARARGS \
 		__entry->xid, __get_sockaddr(server), __get_sockaddr(client)
 
-TRACE_EVENT(svc_authenticate,
+TRACE_EVENT_CONDITION(svc_authenticate,
 	TP_PROTO(const struct svc_rqst *rqst, int auth_res),
 
 	TP_ARGS(rqst, auth_res),
+
+	TP_CONDITION(auth_res != SVC_OK && auth_res != SVC_COMPLETE),
 
 	TP_STRUCT__entry(
 		SVC_RQST_ENDPOINT_FIELDS(rqst)
@@ -1991,20 +2011,24 @@ TRACE_EVENT(svc_wake_up,
 
 TRACE_EVENT(svc_alloc_arg_err,
 	TP_PROTO(
-		unsigned int pages
+		unsigned int requested,
+		unsigned int allocated
 	),
 
-	TP_ARGS(pages),
+	TP_ARGS(requested, allocated),
 
 	TP_STRUCT__entry(
-		__field(unsigned int, pages)
+		__field(unsigned int, requested)
+		__field(unsigned int, allocated)
 	),
 
 	TP_fast_assign(
-		__entry->pages = pages;
+		__entry->requested = requested;
+		__entry->allocated = allocated;
 	),
 
-	TP_printk("pages=%u", __entry->pages)
+	TP_printk("requested=%u allocated=%u",
+		__entry->requested, __entry->allocated)
 );
 
 DECLARE_EVENT_CLASS(svc_deferred_event,
@@ -2017,18 +2041,17 @@ DECLARE_EVENT_CLASS(svc_deferred_event,
 	TP_STRUCT__entry(
 		__field(const void *, dr)
 		__field(u32, xid)
-		__string(addr, dr->xprt->xpt_remotebuf)
+		__sockaddr(addr, dr->addrlen)
 	),
 
 	TP_fast_assign(
 		__entry->dr = dr;
-		__entry->xid = be32_to_cpu(*(__be32 *)(dr->args +
-						       (dr->xprt_hlen>>2)));
-		__assign_str(addr, dr->xprt->xpt_remotebuf);
+		__entry->xid = be32_to_cpu(*(__be32 *)dr->args);
+		__assign_sockaddr(addr, &dr->addr, dr->addrlen);
 	),
 
-	TP_printk("addr=%s dr=%p xid=0x%08x", __get_str(addr), __entry->dr,
-		__entry->xid)
+	TP_printk("addr=%pISpc dr=%p xid=0x%08x", __get_sockaddr(addr),
+		__entry->dr, __entry->xid)
 );
 
 #define DEFINE_SVC_DEFERRED_EVENT(name) \

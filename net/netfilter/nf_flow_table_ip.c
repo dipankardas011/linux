@@ -248,6 +248,15 @@ static bool nf_flow_exceeds_mtu(const struct sk_buff *skb, unsigned int mtu)
 	return true;
 }
 
+static inline bool nf_flow_dst_check(struct flow_offload_tuple *tuple)
+{
+	if (tuple->xmit_type != FLOW_OFFLOAD_XMIT_NEIGH &&
+	    tuple->xmit_type != FLOW_OFFLOAD_XMIT_XFRM)
+		return true;
+
+	return dst_check(tuple->dst_cache, tuple->dst_cookie);
+}
+
 static unsigned int nf_flow_xmit_xfrm(struct sk_buff *skb,
 				      const struct nf_hook_state *state,
 				      struct dst_entry *dst)
@@ -367,6 +376,11 @@ nf_flow_offload_ip_hook(void *priv, struct sk_buff *skb,
 	if (nf_flow_state_check(flow, iph->protocol, skb, thoff))
 		return NF_ACCEPT;
 
+	if (!nf_flow_dst_check(&tuplehash->tuple)) {
+		flow_offload_teardown(flow);
+		return NF_ACCEPT;
+	}
+
 	if (skb_try_make_writable(skb, thoff + hdrsize))
 		return NF_DROP;
 
@@ -406,6 +420,10 @@ nf_flow_offload_ip_hook(void *priv, struct sk_buff *skb,
 		ret = nf_flow_queue_xmit(state->net, skb, tuplehash, ETH_P_IP);
 		if (ret == NF_DROP)
 			flow_offload_teardown(flow);
+		break;
+	default:
+		WARN_ON_ONCE(1);
+		ret = NF_DROP;
 		break;
 	}
 
@@ -624,6 +642,11 @@ nf_flow_offload_ipv6_hook(void *priv, struct sk_buff *skb,
 	if (nf_flow_state_check(flow, ip6h->nexthdr, skb, thoff))
 		return NF_ACCEPT;
 
+	if (!nf_flow_dst_check(&tuplehash->tuple)) {
+		flow_offload_teardown(flow);
+		return NF_ACCEPT;
+	}
+
 	if (skb_try_make_writable(skb, thoff + hdrsize))
 		return NF_DROP;
 
@@ -662,6 +685,10 @@ nf_flow_offload_ipv6_hook(void *priv, struct sk_buff *skb,
 		ret = nf_flow_queue_xmit(state->net, skb, tuplehash, ETH_P_IPV6);
 		if (ret == NF_DROP)
 			flow_offload_teardown(flow);
+		break;
+	default:
+		WARN_ON_ONCE(1);
+		ret = NF_DROP;
 		break;
 	}
 

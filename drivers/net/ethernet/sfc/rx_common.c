@@ -150,6 +150,9 @@ static void efx_fini_rx_recycle_ring(struct efx_rx_queue *rx_queue)
 	struct efx_nic *efx = rx_queue->efx;
 	int i;
 
+	if (unlikely(!rx_queue->page_ring))
+		return;
+
 	/* Unmap and release the pages in the recycle ring. Remove the ring. */
 	for (i = 0; i <= rx_queue->page_ptr_mask; i++) {
 		struct page *page = rx_queue->page_ring[i];
@@ -226,6 +229,7 @@ void efx_init_rx_queue(struct efx_rx_queue *rx_queue)
 	/* Initialise ptr fields */
 	rx_queue->added_count = 0;
 	rx_queue->notified_count = 0;
+	rx_queue->granted_count = 0;
 	rx_queue->removed_count = 0;
 	rx_queue->min_fill = -1U;
 	efx_init_rx_recycle_ring(rx_queue);
@@ -278,6 +282,8 @@ void efx_fini_rx_queue(struct efx_rx_queue *rx_queue)
 		  "shutting down RX queue %d\n", efx_rx_queue_index(rx_queue));
 
 	del_timer_sync(&rx_queue->slow_fill);
+	if (rx_queue->grant_credits)
+		flush_work(&rx_queue->grant_work);
 
 	/* Release RX buffers from the current read ptr to the write ptr */
 	if (rx_queue->buffer) {
@@ -657,17 +663,17 @@ bool efx_filter_spec_equal(const struct efx_filter_spec *left,
 	     (EFX_FILTER_FLAG_RX | EFX_FILTER_FLAG_TX)))
 		return false;
 
-	return memcmp(&left->outer_vid, &right->outer_vid,
+	return memcmp(&left->vport_id, &right->vport_id,
 		      sizeof(struct efx_filter_spec) -
-		      offsetof(struct efx_filter_spec, outer_vid)) == 0;
+		      offsetof(struct efx_filter_spec, vport_id)) == 0;
 }
 
 u32 efx_filter_spec_hash(const struct efx_filter_spec *spec)
 {
-	BUILD_BUG_ON(offsetof(struct efx_filter_spec, outer_vid) & 3);
-	return jhash2((const u32 *)&spec->outer_vid,
+	BUILD_BUG_ON(offsetof(struct efx_filter_spec, vport_id) & 3);
+	return jhash2((const u32 *)&spec->vport_id,
 		      (sizeof(struct efx_filter_spec) -
-		       offsetof(struct efx_filter_spec, outer_vid)) / 4,
+		       offsetof(struct efx_filter_spec, vport_id)) / 4,
 		      0);
 }
 
@@ -790,7 +796,6 @@ int efx_probe_filters(struct efx_nic *efx)
 	int rc;
 
 	mutex_lock(&efx->mac_lock);
-	down_write(&efx->filter_sem);
 	rc = efx->type->filter_table_probe(efx);
 	if (rc)
 		goto out_unlock;
@@ -827,7 +832,6 @@ int efx_probe_filters(struct efx_nic *efx)
 	}
 #endif
 out_unlock:
-	up_write(&efx->filter_sem);
 	mutex_unlock(&efx->mac_lock);
 	return rc;
 }
@@ -843,9 +847,7 @@ void efx_remove_filters(struct efx_nic *efx)
 		channel->rps_flow_id = NULL;
 	}
 #endif
-	down_write(&efx->filter_sem);
 	efx->type->filter_table_remove(efx);
-	up_write(&efx->filter_sem);
 }
 
 #ifdef CONFIG_RFS_ACCEL
@@ -854,7 +856,7 @@ static void efx_filter_rfs_work(struct work_struct *data)
 {
 	struct efx_async_filter_insertion *req = container_of(data, struct efx_async_filter_insertion,
 							      work);
-	struct efx_nic *efx = netdev_priv(req->net_dev);
+	struct efx_nic *efx = efx_netdev_priv(req->net_dev);
 	struct efx_channel *channel = efx_get_channel(efx, req->rxq_index);
 	int slot_idx = req - efx->rps_slot;
 	struct efx_arfs_rule *rule;
@@ -939,7 +941,7 @@ static void efx_filter_rfs_work(struct work_struct *data)
 int efx_filter_rfs(struct net_device *net_dev, const struct sk_buff *skb,
 		   u16 rxq_index, u32 flow_id)
 {
-	struct efx_nic *efx = netdev_priv(net_dev);
+	struct efx_nic *efx = efx_netdev_priv(net_dev);
 	struct efx_async_filter_insertion *req;
 	struct efx_arfs_rule *rule;
 	struct flow_keys fk;

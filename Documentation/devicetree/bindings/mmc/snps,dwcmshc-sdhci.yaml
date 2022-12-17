@@ -17,6 +17,7 @@ properties:
   compatible:
     enum:
       - rockchip,rk3568-dwcmshc
+      - rockchip,rk3588-dwcmshc
       - snps,dwcmshc-sdhci
 
   reg:
@@ -37,6 +38,17 @@ properties:
 
   clock-names:
     minItems: 1
+    items:
+      - const: core
+      - const: bus
+      - const: axi
+      - const: block
+      - const: timer
+
+  resets:
+    maxItems: 5
+
+  reset-names:
     items:
       - const: core
       - const: bus

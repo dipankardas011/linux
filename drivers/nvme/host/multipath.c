@@ -114,6 +114,31 @@ void nvme_failover_req(struct request *req)
 	kblockd_schedule_work(&ns->head->requeue_work);
 }
 
+void nvme_mpath_start_request(struct request *rq)
+{
+	struct nvme_ns *ns = rq->q->queuedata;
+	struct gendisk *disk = ns->head->disk;
+
+	if (!blk_queue_io_stat(disk->queue) || blk_rq_is_passthrough(rq))
+		return;
+
+	nvme_req(rq)->flags |= NVME_MPATH_IO_STATS;
+	nvme_req(rq)->start_time = bdev_start_io_acct(disk->part0,
+					blk_rq_bytes(rq) >> SECTOR_SHIFT,
+					req_op(rq), jiffies);
+}
+EXPORT_SYMBOL_GPL(nvme_mpath_start_request);
+
+void nvme_mpath_end_request(struct request *rq)
+{
+	struct nvme_ns *ns = rq->q->queuedata;
+
+	if (!(nvme_req(rq)->flags & NVME_MPATH_IO_STATS))
+		return;
+	bdev_end_io_acct(ns->head->disk->part0, req_op(rq),
+		nvme_req(rq)->start_time);
+}
+
 void nvme_kick_requeue_lists(struct nvme_ctrl *ctrl)
 {
 	struct nvme_ns *ns;
@@ -174,14 +199,18 @@ void nvme_mpath_revalidate_paths(struct nvme_ns *ns)
 	struct nvme_ns_head *head = ns->head;
 	sector_t capacity = get_capacity(head->disk);
 	int node;
+	int srcu_idx;
 
+	srcu_idx = srcu_read_lock(&head->srcu);
 	list_for_each_entry_rcu(ns, &head->list, siblings) {
 		if (capacity != get_capacity(ns->disk))
 			clear_bit(NVME_NS_READY, &ns->flags);
 	}
+	srcu_read_unlock(&head->srcu, srcu_idx);
 
 	for_each_node(node)
 		rcu_assign_pointer(head->current_path[node], NULL);
+	kblockd_schedule_work(&head->requeue_work);
 }
 
 static bool nvme_path_is_disabled(struct nvme_ns *ns)
@@ -346,7 +375,7 @@ static void nvme_ns_head_submit_bio(struct bio *bio)
 	 * different queue via blk_steal_bios(), so we need to use the bio_split
 	 * pool from the original queue to allocate the bvecs from.
 	 */
-	blk_queue_split(&bio);
+	bio = bio_split_to_limits(bio);
 
 	srcu_idx = srcu_read_lock(&head->srcu);
 	ns = nvme_find_path(head);
@@ -408,6 +437,7 @@ const struct block_device_operations nvme_ns_head_ops = {
 	.open		= nvme_ns_head_open,
 	.release	= nvme_ns_head_release,
 	.ioctl		= nvme_ns_head_ioctl,
+	.compat_ioctl	= blkdev_compat_ptr_ioctl,
 	.getgeo		= nvme_getgeo,
 	.report_zones	= nvme_ns_head_report_zones,
 	.pr_ops		= &nvme_pr_ops,
@@ -437,6 +467,8 @@ static const struct file_operations nvme_ns_head_chr_fops = {
 	.release	= nvme_ns_head_chr_release,
 	.unlocked_ioctl	= nvme_ns_head_chr_ioctl,
 	.compat_ioctl	= compat_ptr_ioctl,
+	.uring_cmd	= nvme_ns_head_chr_uring_cmd,
+	.uring_cmd_iopoll = nvme_ns_head_chr_uring_cmd_iopoll,
 };
 
 static int nvme_add_ns_head_cdev(struct nvme_ns_head *head)
@@ -482,10 +514,11 @@ int nvme_mpath_alloc_disk(struct nvme_ctrl *ctrl, struct nvme_ns_head *head)
 
 	/*
 	 * Add a multipath node if the subsystems supports multiple controllers.
-	 * We also do this for private namespaces as the namespace sharing data could
-	 * change after a rescan.
+	 * We also do this for private namespaces as the namespace sharing flag
+	 * could change after a rescan.
 	 */
-	if (!(ctrl->subsys->cmic & NVME_CTRL_CMIC_MULTI_CTRL) || !multipath)
+	if (!(ctrl->subsys->cmic & NVME_CTRL_CMIC_MULTI_CTRL) ||
+	    !nvme_is_unique_nsid(ctrl, head) || !multipath)
 		return 0;
 
 	head->disk = blk_alloc_disk(ctrl->numa_node);
@@ -498,6 +531,7 @@ int nvme_mpath_alloc_disk(struct nvme_ctrl *ctrl, struct nvme_ns_head *head)
 
 	blk_queue_flag_set(QUEUE_FLAG_NONROT, head->disk->queue);
 	blk_queue_flag_set(QUEUE_FLAG_NOWAIT, head->disk->queue);
+	blk_queue_flag_set(QUEUE_FLAG_IO_STAT, head->disk->queue);
 	/*
 	 * This assumes all controllers that refer to a namespace either
 	 * support poll queues or not.  That is not a strict guarantee,
@@ -511,6 +545,7 @@ int nvme_mpath_alloc_disk(struct nvme_ctrl *ctrl, struct nvme_ns_head *head)
 	/* set to a default value of 512 until the disk is validated */
 	blk_queue_logical_block_size(head->disk->queue, 512);
 	blk_set_stacking_limits(&head->disk->queue->limits);
+	blk_queue_dma_alignment(head->disk->queue, 3);
 
 	/* we need to propagate up the VMC settings */
 	if (ctrl->vwc & NVME_CTRL_VWC_PRESENT)
@@ -612,8 +647,17 @@ static void nvme_update_ns_ana_state(struct nvme_ana_group_desc *desc,
 	ns->ana_grpid = le32_to_cpu(desc->grpid);
 	ns->ana_state = desc->state;
 	clear_bit(NVME_NS_ANA_PENDING, &ns->flags);
-
-	if (nvme_state_is_live(ns->ana_state))
+	/*
+	 * nvme_mpath_set_live() will trigger I/O to the multipath path device
+	 * and in turn to this path device.  However we cannot accept this I/O
+	 * if the controller is not live.  This may deadlock if called from
+	 * nvme_mpath_init_identify() and the ctrl will never complete
+	 * initialization, preventing I/O from completing.  For this case we
+	 * will reprocess the ANA log page in nvme_mpath_update() once the
+	 * controller is ready.
+	 */
+	if (nvme_state_is_live(ns->ana_state) &&
+	    ns->ctrl->state == NVME_CTRL_LIVE)
 		nvme_mpath_set_live(ns);
 }
 
@@ -700,6 +744,18 @@ static void nvme_ana_work(struct work_struct *work)
 	nvme_read_ana_log(ctrl);
 }
 
+void nvme_mpath_update(struct nvme_ctrl *ctrl)
+{
+	u32 nr_change_groups = 0;
+
+	if (!ctrl->ana_log_buf)
+		return;
+
+	mutex_lock(&ctrl->ana_lock);
+	nvme_parse_ana_log(ctrl, &nr_change_groups, nvme_update_ana_state);
+	mutex_unlock(&ctrl->ana_lock);
+}
+
 static void nvme_anatt_timeout(struct timer_list *t)
 {
 	struct nvme_ctrl *ctrl = from_timer(ctrl, t, anatt_timer);
@@ -777,16 +833,16 @@ static int nvme_lookup_ana_group_desc(struct nvme_ctrl *ctrl,
 	return -ENXIO; /* just break out of the loop */
 }
 
-void nvme_mpath_add_disk(struct nvme_ns *ns, struct nvme_id_ns *id)
+void nvme_mpath_add_disk(struct nvme_ns *ns, __le32 anagrpid)
 {
 	if (nvme_ctrl_use_ana(ns->ctrl)) {
 		struct nvme_ana_group_desc desc = {
-			.grpid = id->anagrpid,
+			.grpid = anagrpid,
 			.state = 0,
 		};
 
 		mutex_lock(&ns->ctrl->ana_lock);
-		ns->ana_grpid = le32_to_cpu(id->anagrpid);
+		ns->ana_grpid = le32_to_cpu(anagrpid);
 		nvme_parse_ana_log(ns->ctrl, &desc, nvme_lookup_ana_group_desc);
 		mutex_unlock(&ns->ctrl->ana_lock);
 		if (desc.state) {
@@ -807,7 +863,7 @@ void nvme_mpath_add_disk(struct nvme_ns *ns, struct nvme_id_ns *id)
 				   ns->head->disk->queue);
 #ifdef CONFIG_BLK_DEV_ZONED
 	if (blk_queue_is_zoned(ns->queue) && ns->head->disk)
-		ns->head->disk->queue->nr_zones = ns->queue->nr_zones;
+		ns->head->disk->nr_zones = ns->disk->nr_zones;
 #endif
 }
 
@@ -830,7 +886,7 @@ void nvme_mpath_remove_disk(struct nvme_ns_head *head)
 	/* make sure all pending bios are cleaned up */
 	kblockd_schedule_work(&head->requeue_work);
 	flush_work(&head->requeue_work);
-	blk_cleanup_disk(head->disk);
+	put_disk(head->disk);
 }
 
 void nvme_mpath_init_ctrl(struct nvme_ctrl *ctrl)

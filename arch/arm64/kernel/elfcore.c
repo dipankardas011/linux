@@ -8,13 +8,6 @@
 #include <asm/cpufeature.h>
 #include <asm/mte.h>
 
-#ifndef VMA_ITERATOR
-#define VMA_ITERATOR(name, mm, addr)	\
-	struct mm_struct *name = mm
-#define for_each_vma(vmi, vma)		\
-	for (vma = vmi->mmap; vma; vma = vma->vm_next)
-#endif
-
 #define for_each_mte_vma(vmi, vma)					\
 	if (system_supports_mte())					\
 		for_each_vma(vmi, vma)					\
@@ -32,10 +25,11 @@ static unsigned long mte_vma_tag_dump_size(struct vm_area_struct *vma)
 static int mte_dump_tag_range(struct coredump_params *cprm,
 			      unsigned long start, unsigned long end)
 {
+	int ret = 1;
 	unsigned long addr;
+	void *tags = NULL;
 
 	for (addr = start; addr < end; addr += PAGE_SIZE) {
-		char tags[MTE_PAGE_TAG_STORAGE];
 		struct page *page = get_dump_page(addr);
 
 		/*
@@ -53,19 +47,34 @@ static int mte_dump_tag_range(struct coredump_params *cprm,
 		 * Pages mapped in user space as !pte_access_permitted() (e.g.
 		 * PROT_EXEC only) may not have the PG_mte_tagged flag set.
 		 */
-		if (!test_bit(PG_mte_tagged, &page->flags)) {
+		if (!page_mte_tagged(page)) {
 			put_page(page);
 			dump_skip(cprm, MTE_PAGE_TAG_STORAGE);
 			continue;
 		}
 
+		if (!tags) {
+			tags = mte_allocate_tag_storage();
+			if (!tags) {
+				put_page(page);
+				ret = 0;
+				break;
+			}
+		}
+
 		mte_save_page_tags(page_address(page), tags);
 		put_page(page);
-		if (!dump_emit(cprm, tags, MTE_PAGE_TAG_STORAGE))
-			return 0;
+		if (!dump_emit(cprm, tags, MTE_PAGE_TAG_STORAGE)) {
+			mte_free_tag_storage(tags);
+			ret = 0;
+			break;
+		}
 	}
 
-	return 1;
+	if (tags)
+		mte_free_tag_storage(tags);
+
+	return ret;
 }
 
 Elf_Half elf_core_extra_phdrs(void)
@@ -88,7 +97,7 @@ int elf_core_write_extra_phdrs(struct coredump_params *cprm, loff_t offset)
 	for_each_mte_vma(vmi, vma) {
 		struct elf_phdr phdr;
 
-		phdr.p_type = PT_ARM_MEMTAG_MTE;
+		phdr.p_type = PT_AARCH64_MEMTAG_MTE;
 		phdr.p_offset = offset;
 		phdr.p_vaddr = vma->vm_start;
 		phdr.p_paddr = 0;

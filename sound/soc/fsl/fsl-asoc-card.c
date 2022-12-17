@@ -462,11 +462,9 @@ static int hp_jack_event(struct notifier_block *nb, unsigned long event,
 
 	if (event & SND_JACK_HEADPHONE)
 		/* Disable speaker if headphone is plugged in */
-		snd_soc_dapm_disable_pin(dapm, "Ext Spk");
+		return snd_soc_dapm_disable_pin(dapm, "Ext Spk");
 	else
-		snd_soc_dapm_enable_pin(dapm, "Ext Spk");
-
-	return 0;
+		return snd_soc_dapm_enable_pin(dapm, "Ext Spk");
 }
 
 static struct notifier_block hp_jack_nb = {
@@ -481,11 +479,9 @@ static int mic_jack_event(struct notifier_block *nb, unsigned long event,
 
 	if (event & SND_JACK_MICROPHONE)
 		/* Disable dmic if microphone is plugged in */
-		snd_soc_dapm_disable_pin(dapm, "DMIC");
+		return snd_soc_dapm_disable_pin(dapm, "DMIC");
 	else
-		snd_soc_dapm_enable_pin(dapm, "DMIC");
-
-	return 0;
+		return snd_soc_dapm_enable_pin(dapm, "DMIC");
 }
 
 static struct notifier_block mic_jack_nb = {
@@ -541,6 +537,7 @@ static int fsl_asoc_card_probe(struct platform_device *pdev)
 	struct device *codec_dev = NULL;
 	const char *codec_dai_name;
 	const char *codec_dev_name;
+	u32 asrc_fmt = 0;
 	u32 width;
 	int ret;
 
@@ -833,8 +830,8 @@ static int fsl_asoc_card_probe(struct platform_device *pdev)
 			goto asrc_fail;
 		}
 
-		ret = of_property_read_u32(asrc_np, "fsl,asrc-format",
-					   &priv->asrc_format);
+		ret = of_property_read_u32(asrc_np, "fsl,asrc-format", &asrc_fmt);
+		priv->asrc_format = (__force snd_pcm_format_t)asrc_fmt;
 		if (ret) {
 			/* Fallback to old binding; translate to asrc_format */
 			ret = of_property_read_u32(asrc_np, "fsl,asrc-width",
